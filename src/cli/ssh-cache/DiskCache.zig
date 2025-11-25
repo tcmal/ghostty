@@ -234,7 +234,7 @@ fn writeCacheFile(
     try writer.interface.flush();
 
     // Atomic replace
-    try std.fs.renameAbsolute(tmp_path, self.path);
+    try std.fs.copyFileAbsolute(tmp_path, self.path, .{});
 }
 
 /// List all entries in the cache.
