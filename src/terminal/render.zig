@@ -385,6 +385,7 @@ pub const RenderState = struct {
         const row_rows = row_data.items(.raw);
         const row_cells = row_data.items(.cells);
         const row_sels = row_data.items(.selection);
+        const row_highlights = row_data.items(.highlights);
         const row_dirties = row_data.items(.dirty);
 
         // Track the last page that we know was dirty. This lets us
@@ -441,6 +442,7 @@ pub const RenderState = struct {
                     // faster than iterating pages again later.
                     if (last_dirty_page) |last_p| last_p.dirty = false;
                     last_dirty_page = p;
+                    break :dirty;
                 }
 
                 // If our row is dirty then we're dirty.
@@ -467,6 +469,7 @@ pub const RenderState = struct {
                 _ = arena.reset(.retain_capacity);
                 row_cells[y].clearRetainingCapacity();
                 row_sels[y] = null;
+                row_highlights[y] = .empty;
             }
             row_dirties[y] = true;
 
@@ -702,8 +705,16 @@ pub const RenderState = struct {
                         .{
                             .tag = tag,
                             .range = .{
-                                if (i == 0) hl.top_x else 0,
-                                if (i == nodes.len - 1) hl.bot_x else self.cols - 1,
+                                if (i == 0 and
+                                    row_pin.y == starts[0])
+                                    hl.top_x
+                                else
+                                    0,
+                                if (i == nodes.len - 1 and
+                                    row_pin.y == ends[nodes.len - 1] - 1)
+                                    hl.bot_x
+                                else
+                                    self.cols - 1,
                             },
                         },
                     );
@@ -805,12 +816,19 @@ pub const RenderState = struct {
         const row_pins = row_slice.items(.pin);
         const row_cells = row_slice.items(.cells);
 
+        // Our viewport point is sent in by the caller and can't be trusted.
+        // If it is outside the valid area then just return empty because
+        // we can't possibly have a link there.
+        if (viewport_point.x >= self.cols or
+            viewport_point.y >= row_pins.len) return result;
+
         // Grab our link ID
-        const link_page: *page.Page = &row_pins[viewport_point.y].node.data;
+        const link_pin: PageList.Pin = row_pins[viewport_point.y];
+        const link_page: *page.Page = &link_pin.node.data;
         const link = link: {
             const rac = link_page.getRowAndCell(
                 viewport_point.x,
-                viewport_point.y,
+                link_pin.y,
             );
 
             // The likely scenario is that our mouse isn't even over a link.
@@ -837,7 +855,7 @@ pub const RenderState = struct {
 
                 const other_page: *page.Page = &pin.node.data;
                 const other = link: {
-                    const rac = other_page.getRowAndCell(x, y);
+                    const rac = other_page.getRowAndCell(x, pin.y);
                     const link_id = other_page.lookupHyperlink(rac.cell) orelse continue;
                     break :link other_page.hyperlink_set.get(
                         other_page.memory,
@@ -1304,4 +1322,143 @@ test "string" {
 
     const expected = "AB\x00\x00\x00\n\x00\x00\x00\x00\x00\n";
     try testing.expectEqualStrings(expected, result);
+}
+
+test "linkCells with scrollback spanning pages" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const viewport_rows: size.CellCountInt = 10;
+    const tail_rows: size.CellCountInt = 5;
+
+    var t = try Terminal.init(alloc, .{
+        .cols = page.std_capacity.cols,
+        .rows = viewport_rows,
+        .max_scrollback = 10_000,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+
+    const pages = &t.screens.active.pages;
+    const first_page_cap = pages.pages.first.?.data.capacity.rows;
+
+    // Fill first page
+    for (0..first_page_cap - 1) |_| try s.nextSlice("\r\n");
+
+    // Create second page with hyperlink
+    try s.nextSlice("\r\n");
+    try s.nextSlice("\x1b]8;;http://example.com\x1b\\LINK\x1b]8;;\x1b\\");
+    for (0..(tail_rows - 1)) |_| try s.nextSlice("\r\n");
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    const expected_viewport_y: usize = viewport_rows - tail_rows;
+    // BUG: This crashes without the fix
+    var cells = try state.linkCells(alloc, .{
+        .x = 0,
+        .y = expected_viewport_y,
+    });
+    defer cells.deinit(alloc);
+    try testing.expectEqual(@as(usize, 4), cells.count());
+}
+
+test "linkCells with invalid viewport point" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{
+        .cols = 10,
+        .rows = 5,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    // Row out of bound
+    {
+        var cells = try state.linkCells(
+            alloc,
+            .{ .x = 0, .y = t.rows + 10 },
+        );
+        defer cells.deinit(alloc);
+        try testing.expectEqual(0, cells.count());
+    }
+
+    // Col out of bound
+    {
+        var cells = try state.linkCells(
+            alloc,
+            .{ .x = t.cols + 10, .y = 0 },
+        );
+        defer cells.deinit(alloc);
+        try testing.expectEqual(0, cells.count());
+    }
+}
+
+test "dirty row resets highlights" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{
+        .cols = 10,
+        .rows = 3,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    try s.nextSlice("ABC");
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    // Reset dirty state
+    state.dirty = .false;
+    {
+        const row_data = state.row_data.slice();
+        const dirty = row_data.items(.dirty);
+        @memset(dirty, false);
+    }
+
+    // Manually add a highlight to row 0
+    {
+        const row_data = state.row_data.slice();
+        const row_arenas = row_data.items(.arena);
+        const row_highlights = row_data.items(.highlights);
+        var arena = row_arenas[0].promote(alloc);
+        defer row_arenas[0] = arena.state;
+        try row_highlights[0].append(arena.allocator(), .{
+            .tag = 1,
+            .range = .{ 0, 2 },
+        });
+    }
+
+    // Verify we have a highlight
+    {
+        const row_data = state.row_data.slice();
+        const row_highlights = row_data.items(.highlights);
+        try testing.expectEqual(1, row_highlights[0].items.len);
+    }
+
+    // Write to row 0 to make it dirty
+    try s.nextSlice("\x1b[H"); // Move to home
+    try s.nextSlice("X");
+    try state.update(alloc, &t);
+
+    // Verify the highlight was reset on the dirty row
+    {
+        const row_data = state.row_data.slice();
+        const row_highlights = row_data.items(.highlights);
+        try testing.expectEqual(0, row_highlights[0].items.len);
+    }
 }

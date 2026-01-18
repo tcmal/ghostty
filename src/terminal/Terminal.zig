@@ -5,7 +5,6 @@ const Terminal = @This();
 
 const std = @import("std");
 const build_options = @import("terminal_options");
-const builtin = @import("builtin");
 const assert = @import("../quirks.zig").inlineAssert;
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
@@ -676,7 +675,7 @@ fn printCell(
 
             // TODO: this case was not handled in the old terminal implementation
             // but it feels like we should do something. investigate other
-            // terminals (xterm mainly) and see whats up.
+            // terminals (xterm mainly) and see what's up.
             .spacer_head => {},
         }
     }
@@ -1220,7 +1219,7 @@ pub fn index(self: *Terminal) !void {
             // this check.
             !self.screens.active.blankCell().isZero())
         {
-            self.scrollUp(1);
+            try self.scrollUp(1);
             return;
         }
 
@@ -1399,7 +1398,7 @@ pub fn scrollDown(self: *Terminal, count: usize) void {
 /// The new lines are created according to the current SGR state.
 ///
 /// Does not change the (absolute) cursor position.
-pub fn scrollUp(self: *Terminal, count: usize) void {
+pub fn scrollUp(self: *Terminal, count: usize) !void {
     // Preserve our x/y to restore.
     const old_x = self.screens.active.cursor.x;
     const old_y = self.screens.active.cursor.y;
@@ -1407,6 +1406,32 @@ pub fn scrollUp(self: *Terminal, count: usize) void {
     defer {
         self.screens.active.cursorAbsolute(old_x, old_y);
         self.screens.active.cursor.pending_wrap = old_wrap;
+    }
+
+    // If our scroll region is at the top and we have no left/right
+    // margins then we move the scrolled out text into the scrollback.
+    if (self.scrolling_region.top == 0 and
+        self.scrolling_region.left == 0 and
+        self.scrolling_region.right == self.cols - 1)
+    {
+        // Scrolling dirties the images because it updates their placements pins.
+        if (comptime build_options.kitty_graphics) {
+            self.screens.active.kitty_images.dirty = true;
+        }
+
+        // Clamp count to the scroll region height.
+        const region_height = self.scrolling_region.bottom + 1;
+        const adjusted_count = @min(count, region_height);
+
+        // TODO: Create an optimized version that can scroll N times
+        // This isn't critical because in most cases, scrollUp is used
+        // with count=1, but it's still a big optimization opportunity.
+
+        // Move our cursor to the bottom of the scroll region so we can
+        // use the cursorScrollAbove function to create scrollback
+        self.screens.active.cursorAbsolute(0, self.scrolling_region.bottom);
+        for (0..adjusted_count) |_| try self.screens.active.cursorScrollAbove();
+        return;
     }
 
     // Move to the top of the scroll region
@@ -1577,9 +1602,6 @@ pub fn insertLines(self: *Terminal, count: usize) void {
         const cur_rac = cur_p.rowAndCell();
         const cur_row: *Row = cur_rac.row;
 
-        // Mark the row as dirty
-        cur_p.markDirty();
-
         // If this is one of the lines we need to shift, do so
         if (y > adjusted_count) {
             const off_p = cur_p.up(adjusted_count).?;
@@ -1612,54 +1634,48 @@ pub fn insertLines(self: *Terminal, count: usize) void {
                     self.scrolling_region.left,
                     self.scrolling_region.right + 1,
                 ) catch |err| {
-                    const cap = dst_p.node.data.capacity;
                     // Adjust our page capacity to make
                     // room for we didn't have space for
-                    _ = self.screens.active.adjustCapacity(
+                    _ = self.screens.active.increaseCapacity(
                         dst_p.node,
                         switch (err) {
                             // Rehash the sets
                             error.StyleSetNeedsRehash,
                             error.HyperlinkSetNeedsRehash,
-                            => .{},
+                            => null,
 
                             // Increase style memory
                             error.StyleSetOutOfMemory,
-                            => .{ .styles = cap.styles * 2 },
+                            => .styles,
 
                             // Increase string memory
                             error.StringAllocOutOfMemory,
-                            => .{ .string_bytes = cap.string_bytes * 2 },
+                            => .string_bytes,
 
                             // Increase hyperlink memory
                             error.HyperlinkSetOutOfMemory,
                             error.HyperlinkMapOutOfMemory,
-                            => .{ .hyperlink_bytes = cap.hyperlink_bytes * 2 },
+                            => .hyperlink_bytes,
 
                             // Increase grapheme memory
                             error.GraphemeMapOutOfMemory,
                             error.GraphemeAllocOutOfMemory,
-                            => .{ .grapheme_bytes = cap.grapheme_bytes * 2 },
+                            => .grapheme_bytes,
                         },
                     ) catch |e| switch (e) {
-                        // This shouldn't be possible because above we're only
-                        // adjusting capacity _upwards_. So it should have all
-                        // the existing capacity it had to fit the adjusted
-                        // data. Panic since we don't expect this.
-                        error.StyleSetOutOfMemory,
-                        error.StyleSetNeedsRehash,
-                        error.StringAllocOutOfMemory,
-                        error.HyperlinkSetOutOfMemory,
-                        error.HyperlinkSetNeedsRehash,
-                        error.HyperlinkMapOutOfMemory,
-                        error.GraphemeMapOutOfMemory,
-                        error.GraphemeAllocOutOfMemory,
-                        => @panic("adjustCapacity resulted in capacity errors"),
-
-                        // The system allocator is OOM. We can't currently do
-                        // anything graceful here. We panic.
+                        // System OOM. We have no way to recover from this
+                        // currently. We should probably change insertLines
+                        // to raise an error here.
                         error.OutOfMemory,
-                        => @panic("adjustCapacity system allocator OOM"),
+                        => @panic("increaseCapacity system allocator OOM"),
+
+                        // The page can't accommodate the managed memory required
+                        // for this operation. We previously just corrupted
+                        // memory here so a crash is better. The right long
+                        // term solution is to allocate a new page here
+                        // move this row to the new page, and start over.
+                        error.OutOfSpace,
+                        => @panic("increaseCapacity OutOfSpace"),
                     };
 
                     // Continue the loop to try handling this row again.
@@ -1673,9 +1689,6 @@ pub fn insertLines(self: *Terminal, count: usize) void {
                     const dst = dst_row.*;
                     dst_row.* = src_row.*;
                     src_row.* = dst;
-
-                    // Make sure the row is marked as dirty though.
-                    dst_row.dirty = true;
 
                     // Ensure what we did didn't corrupt the page
                     cur_p.node.data.assertIntegrity();
@@ -1702,6 +1715,9 @@ pub fn insertLines(self: *Terminal, count: usize) void {
                 cells[self.scrolling_region.left .. self.scrolling_region.right + 1],
             );
         }
+
+        // Mark the row as dirty
+        cur_p.markDirty();
 
         // We have successfully processed a line.
         y -= 1;
@@ -1780,9 +1796,6 @@ pub fn deleteLines(self: *Terminal, count: usize) void {
         const cur_rac = cur_p.rowAndCell();
         const cur_row: *Row = cur_rac.row;
 
-        // Mark the row as dirty
-        cur_p.markDirty();
-
         // If this is one of the lines we need to shift, do so
         if (y < rem - adjusted_count) {
             const off_p = cur_p.down(adjusted_count).?;
@@ -1815,49 +1828,41 @@ pub fn deleteLines(self: *Terminal, count: usize) void {
                     self.scrolling_region.left,
                     self.scrolling_region.right + 1,
                 ) catch |err| {
-                    const cap = dst_p.node.data.capacity;
                     // Adjust our page capacity to make
                     // room for we didn't have space for
-                    _ = self.screens.active.adjustCapacity(
+                    _ = self.screens.active.increaseCapacity(
                         dst_p.node,
                         switch (err) {
                             // Rehash the sets
                             error.StyleSetNeedsRehash,
                             error.HyperlinkSetNeedsRehash,
-                            => .{},
+                            => null,
 
                             // Increase style memory
                             error.StyleSetOutOfMemory,
-                            => .{ .styles = cap.styles * 2 },
+                            => .styles,
 
                             // Increase string memory
                             error.StringAllocOutOfMemory,
-                            => .{ .string_bytes = cap.string_bytes * 2 },
+                            => .string_bytes,
 
                             // Increase hyperlink memory
                             error.HyperlinkSetOutOfMemory,
                             error.HyperlinkMapOutOfMemory,
-                            => .{ .hyperlink_bytes = cap.hyperlink_bytes * 2 },
+                            => .hyperlink_bytes,
 
                             // Increase grapheme memory
                             error.GraphemeMapOutOfMemory,
                             error.GraphemeAllocOutOfMemory,
-                            => .{ .grapheme_bytes = cap.grapheme_bytes * 2 },
+                            => .grapheme_bytes,
                         },
                     ) catch |e| switch (e) {
-                        // See insertLines which has the same error capture.
-                        error.StyleSetOutOfMemory,
-                        error.StyleSetNeedsRehash,
-                        error.StringAllocOutOfMemory,
-                        error.HyperlinkSetOutOfMemory,
-                        error.HyperlinkSetNeedsRehash,
-                        error.HyperlinkMapOutOfMemory,
-                        error.GraphemeMapOutOfMemory,
-                        error.GraphemeAllocOutOfMemory,
-                        => @panic("adjustCapacity resulted in capacity errors"),
-
+                        // See insertLines
                         error.OutOfMemory,
-                        => @panic("adjustCapacity system allocator OOM"),
+                        => @panic("increaseCapacity system allocator OOM"),
+
+                        error.OutOfSpace,
+                        => @panic("increaseCapacity OutOfSpace"),
                     };
 
                     // Continue the loop to try handling this row again.
@@ -1871,9 +1876,6 @@ pub fn deleteLines(self: *Terminal, count: usize) void {
                     const dst = dst_row.*;
                     dst_row.* = src_row.*;
                     src_row.* = dst;
-
-                    // Make sure the row is marked as dirty though.
-                    dst_row.dirty = true;
 
                     // Ensure what we did didn't corrupt the page
                     cur_p.node.data.assertIntegrity();
@@ -1900,6 +1902,9 @@ pub fn deleteLines(self: *Terminal, count: usize) void {
                 cells[self.scrolling_region.left .. self.scrolling_region.right + 1],
             );
         }
+
+        // Mark the row as dirty
+        cur_p.markDirty();
 
         // We have successfully processed a line.
         y += 1;
@@ -5394,6 +5399,52 @@ test "Terminal: insertLines top/bottom scroll region" {
     }
 }
 
+test "Terminal: insertLines across page boundary marks all shifted rows dirty" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .rows = 5, .cols = 10, .max_scrollback = 1024 });
+    defer t.deinit(alloc);
+
+    const first_page = t.screens.active.pages.pages.first.?;
+    const first_page_nrows = first_page.data.capacity.rows;
+
+    // Fill up the first page minus 3 rows
+    for (0..first_page_nrows - 3) |_| try t.linefeed();
+
+    // Add content that will cross a page boundary
+    try t.printString("1AAAA");
+    t.carriageReturn();
+    try t.linefeed();
+    try t.printString("2BBBB");
+    t.carriageReturn();
+    try t.linefeed();
+    try t.printString("3CCCC");
+    t.carriageReturn();
+    try t.linefeed();
+    try t.printString("4DDDD");
+    t.carriageReturn();
+    try t.linefeed();
+    try t.printString("5EEEE");
+
+    // Verify we now have a second page
+    try testing.expect(first_page.next != null);
+
+    t.setCursorPos(1, 1);
+    t.clearDirty();
+    t.insertLines(1);
+
+    try testing.expect(t.isDirty(.{ .active = .{ .x = 0, .y = 0 } }));
+    try testing.expect(t.isDirty(.{ .active = .{ .x = 0, .y = 1 } }));
+    try testing.expect(t.isDirty(.{ .active = .{ .x = 0, .y = 2 } }));
+    try testing.expect(t.isDirty(.{ .active = .{ .x = 0, .y = 3 } }));
+    try testing.expect(t.isDirty(.{ .active = .{ .x = 0, .y = 4 } }));
+
+    {
+        const str = try t.plainString(testing.allocator);
+        defer testing.allocator.free(str);
+        try testing.expectEqualStrings("\n1AAAA\n2BBBB\n3CCCC\n4DDDD", str);
+    }
+}
+
 test "Terminal: insertLines (legacy test)" {
     const alloc = testing.allocator;
     var t = try init(alloc, .{ .cols = 2, .rows = 5 });
@@ -5636,14 +5687,16 @@ test "Terminal: scrollUp simple" {
     t.setCursorPos(2, 2);
 
     const cursor = t.screens.active.cursor;
-    t.clearDirty();
-    t.scrollUp(1);
+    const viewport_before = t.screens.active.pages.getTopLeft(.viewport);
+    try t.scrollUp(1);
     try testing.expectEqual(cursor.x, t.screens.active.cursor.x);
     try testing.expectEqual(cursor.y, t.screens.active.cursor.y);
 
-    try testing.expect(t.isDirty(.{ .active = .{ .x = 0, .y = 0 } }));
-    try testing.expect(t.isDirty(.{ .active = .{ .x = 0, .y = 1 } }));
-    try testing.expect(t.isDirty(.{ .active = .{ .x = 0, .y = 2 } }));
+    // Viewport should have moved. Our entire page should've scrolled!
+    // The viewport moving will cause our render state to make the full
+    // frame as dirty.
+    const viewport_after = t.screens.active.pages.getTopLeft(.viewport);
+    try testing.expect(!viewport_before.eql(viewport_after));
 
     {
         const str = try t.plainString(testing.allocator);
@@ -5667,7 +5720,7 @@ test "Terminal: scrollUp moves hyperlink" {
     try t.linefeed();
     try t.printString("GHI");
     t.setCursorPos(2, 2);
-    t.scrollUp(1);
+    try t.scrollUp(1);
 
     {
         const str = try t.plainString(testing.allocator);
@@ -5718,7 +5771,7 @@ test "Terminal: scrollUp clears hyperlink" {
     try t.linefeed();
     try t.printString("GHI");
     t.setCursorPos(2, 2);
-    t.scrollUp(1);
+    try t.scrollUp(1);
 
     {
         const str = try t.plainString(testing.allocator);
@@ -5756,7 +5809,7 @@ test "Terminal: scrollUp top/bottom scroll region" {
     t.setCursorPos(1, 1);
 
     t.clearDirty();
-    t.scrollUp(1);
+    try t.scrollUp(1);
 
     // This is dirty because the cursor moves from this row
     try testing.expect(t.isDirty(.{ .active = .{ .x = 0, .y = 0 } }));
@@ -5788,7 +5841,7 @@ test "Terminal: scrollUp left/right scroll region" {
 
     const cursor = t.screens.active.cursor;
     t.clearDirty();
-    t.scrollUp(1);
+    try t.scrollUp(1);
     try testing.expectEqual(cursor.x, t.screens.active.cursor.x);
     try testing.expectEqual(cursor.y, t.screens.active.cursor.y);
 
@@ -5820,7 +5873,7 @@ test "Terminal: scrollUp left/right scroll region hyperlink" {
     t.scrolling_region.left = 1;
     t.scrolling_region.right = 3;
     t.setCursorPos(2, 2);
-    t.scrollUp(1);
+    try t.scrollUp(1);
 
     {
         const str = try t.plainString(testing.allocator);
@@ -5920,7 +5973,7 @@ test "Terminal: scrollUp preserves pending wrap" {
     try t.print('B');
     t.setCursorPos(3, 5);
     try t.print('C');
-    t.scrollUp(1);
+    try t.scrollUp(1);
     try t.print('X');
 
     {
@@ -5941,7 +5994,7 @@ test "Terminal: scrollUp full top/bottom region" {
     t.setTopAndBottomMargin(2, 5);
 
     t.clearDirty();
-    t.scrollUp(4);
+    try t.scrollUp(4);
 
     // This is dirty because the cursor moves from this row
     try testing.expect(t.isDirty(.{ .active = .{ .x = 0, .y = 0 } }));
@@ -5967,7 +6020,7 @@ test "Terminal: scrollUp full top/bottomleft/right scroll region" {
     t.setLeftAndRightMargin(2, 4);
 
     t.clearDirty();
-    t.scrollUp(4);
+    try t.scrollUp(4);
 
     // This is dirty because the cursor moves from this row
     try testing.expect(t.isDirty(.{ .active = .{ .x = 0, .y = 0 } }));
@@ -5980,6 +6033,143 @@ test "Terminal: scrollUp full top/bottomleft/right scroll region" {
         const str = try t.plainString(testing.allocator);
         defer testing.allocator.free(str);
         try testing.expectEqualStrings("top\n\n\n\nA   E", str);
+    }
+}
+
+test "Terminal: scrollUp creates scrollback in primary screen" {
+    // When in primary screen with full-width scroll region at top,
+    // scrollUp (CSI S) should push lines into scrollback like xterm.
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .rows = 5, .cols = 5, .max_scrollback = 10 });
+    defer t.deinit(alloc);
+
+    // Fill the screen with content
+    try t.printString("AAAAA");
+    t.carriageReturn();
+    try t.linefeed();
+    try t.printString("BBBBB");
+    t.carriageReturn();
+    try t.linefeed();
+    try t.printString("CCCCC");
+    t.carriageReturn();
+    try t.linefeed();
+    try t.printString("DDDDD");
+    t.carriageReturn();
+    try t.linefeed();
+    try t.printString("EEEEE");
+
+    t.clearDirty();
+
+    // Scroll up by 1, which should push "AAAAA" into scrollback
+    try t.scrollUp(1);
+
+    // The cursor row (new empty row) should be dirty
+    try testing.expect(t.screens.active.cursor.page_row.dirty);
+
+    // The active screen should now show BBBBB through EEEEE plus one blank line
+    {
+        const str = try t.plainString(alloc);
+        defer alloc.free(str);
+        try testing.expectEqualStrings("BBBBB\nCCCCC\nDDDDD\nEEEEE", str);
+    }
+
+    // Now scroll to the top to see scrollback - AAAAA should be there
+    t.screens.active.scroll(.{ .top = {} });
+    {
+        const str = try t.plainString(alloc);
+        defer alloc.free(str);
+        // Should see AAAAA in scrollback
+        try testing.expectEqualStrings("AAAAA\nBBBBB\nCCCCC\nDDDDD\nEEEEE", str);
+    }
+}
+
+test "Terminal: scrollUp with max_scrollback zero" {
+    // When max_scrollback is 0, scrollUp should still work but not retain history
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .rows = 5, .cols = 5, .max_scrollback = 0 });
+    defer t.deinit(alloc);
+
+    try t.printString("AAAAA");
+    t.carriageReturn();
+    try t.linefeed();
+    try t.printString("BBBBB");
+    t.carriageReturn();
+    try t.linefeed();
+    try t.printString("CCCCC");
+
+    try t.scrollUp(1);
+
+    // Active screen should show scrolled content
+    {
+        const str = try t.plainString(alloc);
+        defer alloc.free(str);
+        try testing.expectEqualStrings("BBBBB\nCCCCC", str);
+    }
+
+    // Scroll to top - should be same as active since no scrollback
+    t.screens.active.scroll(.{ .top = {} });
+    {
+        const str = try t.plainString(alloc);
+        defer alloc.free(str);
+        try testing.expectEqualStrings("BBBBB\nCCCCC", str);
+    }
+}
+
+test "Terminal: scrollUp with max_scrollback zero and top margin" {
+    // When max_scrollback is 0 and top margin is set, should use deleteLines path
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .rows = 5, .cols = 5, .max_scrollback = 0 });
+    defer t.deinit(alloc);
+
+    try t.printString("AAAAA");
+    t.carriageReturn();
+    try t.linefeed();
+    try t.printString("BBBBB");
+    t.carriageReturn();
+    try t.linefeed();
+    try t.printString("CCCCC");
+    t.carriageReturn();
+    try t.linefeed();
+    try t.printString("DDDDD");
+
+    // Set top margin (not at row 0)
+    t.setTopAndBottomMargin(2, 5);
+
+    try t.scrollUp(1);
+
+    {
+        const str = try t.plainString(alloc);
+        defer alloc.free(str);
+        // First row preserved, rest scrolled
+        try testing.expectEqualStrings("AAAAA\nCCCCC\nDDDDD", str);
+    }
+}
+
+test "Terminal: scrollUp with max_scrollback zero and left/right margin" {
+    // When max_scrollback is 0 with left/right margins, uses deleteLines path
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .rows = 5, .cols = 10, .max_scrollback = 0 });
+    defer t.deinit(alloc);
+
+    try t.printString("AAAAABBBBB");
+    t.carriageReturn();
+    try t.linefeed();
+    try t.printString("CCCCCDDDDD");
+    t.carriageReturn();
+    try t.linefeed();
+    try t.printString("EEEEEFFFFF");
+
+    // Set left/right margins (columns 2-6, 1-indexed = indices 1-5)
+    t.modes.set(.enable_left_and_right_margin, true);
+    t.setLeftAndRightMargin(2, 6);
+
+    try t.scrollUp(1);
+
+    {
+        const str = try t.plainString(alloc);
+        defer alloc.free(str);
+        // cols 1-5 scroll, col 0 and cols 6+ preserved
+        try testing.expectEqualStrings("ACCCCDBBBB\nCEEEEFDDDD\nE     FFFF", str);
     }
 }
 
@@ -7878,6 +8068,52 @@ test "Terminal: deleteLines colors with bg color" {
     }
 }
 
+test "Terminal: deleteLines across page boundary marks all shifted rows dirty" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .rows = 5, .cols = 10, .max_scrollback = 1024 });
+    defer t.deinit(alloc);
+
+    const first_page = t.screens.active.pages.pages.first.?;
+    const first_page_nrows = first_page.data.capacity.rows;
+
+    // Fill up the first page minus 3 rows
+    for (0..first_page_nrows - 3) |_| try t.linefeed();
+
+    // Add content that will cross a page boundary
+    try t.printString("1AAAA");
+    t.carriageReturn();
+    try t.linefeed();
+    try t.printString("2BBBB");
+    t.carriageReturn();
+    try t.linefeed();
+    try t.printString("3CCCC");
+    t.carriageReturn();
+    try t.linefeed();
+    try t.printString("4DDDD");
+    t.carriageReturn();
+    try t.linefeed();
+    try t.printString("5EEEE");
+
+    // Verify we now have a second page
+    try testing.expect(first_page.next != null);
+
+    t.setCursorPos(1, 1);
+    t.clearDirty();
+    t.deleteLines(1);
+
+    try testing.expect(t.isDirty(.{ .active = .{ .x = 0, .y = 0 } }));
+    try testing.expect(t.isDirty(.{ .active = .{ .x = 0, .y = 1 } }));
+    try testing.expect(t.isDirty(.{ .active = .{ .x = 0, .y = 2 } }));
+    try testing.expect(t.isDirty(.{ .active = .{ .x = 0, .y = 3 } }));
+    try testing.expect(t.isDirty(.{ .active = .{ .x = 0, .y = 4 } }));
+
+    {
+        const str = try t.plainString(testing.allocator);
+        defer testing.allocator.free(str);
+        try testing.expectEqualStrings("2BBBB\n3CCCC\n4DDDD\n5EEEE", str);
+    }
+}
+
 test "Terminal: deleteLines (legacy)" {
     const alloc = testing.allocator;
     var t = try init(alloc, .{ .cols = 80, .rows = 80 });
@@ -8894,7 +9130,7 @@ test "Terminal: insertBlanks shift graphemes" {
     var t = try init(alloc, .{ .rows = 5, .cols = 5 });
     defer t.deinit(alloc);
 
-    // Disable grapheme clustering
+    // Enable grapheme clustering
     t.modes.set(.grapheme_cluster, true);
 
     try t.printString("A");

@@ -1,19 +1,13 @@
 const std = @import("std");
-const build_config = @import("../../../build_config.zig");
-const assert = @import("../../../quirks.zig").inlineAssert;
 const adw = @import("adw");
 const gio = @import("gio");
 const glib = @import("glib");
 const gobject = @import("gobject");
 const gtk = @import("gtk");
 
-const i18n = @import("../../../os/main.zig").i18n;
 const apprt = @import("../../../apprt.zig");
-const input = @import("../../../input.zig");
 const CoreSurface = @import("../../../Surface.zig");
 const ext = @import("../ext.zig");
-const gtk_version = @import("../gtk_version.zig");
-const adw_version = @import("../adw_version.zig");
 const gresource = @import("../build/gresource.zig");
 const Common = @import("../class.zig").Common;
 const Config = @import("config.zig").Config;
@@ -167,8 +161,12 @@ pub const Tab = extern struct {
     /// ever created for a tab. If a surface was already created this does
     /// nothing.
     pub fn setParent(self: *Self, parent: *CoreSurface) void {
+        self.setParentWithContext(parent, .tab);
+    }
+
+    pub fn setParentWithContext(self: *Self, parent: *CoreSurface, context: apprt.surface.NewSurfaceContext) void {
         if (self.getActiveSurface()) |surface| {
-            surface.setParent(parent);
+            surface.setParent(parent, context);
         }
     }
 
@@ -353,6 +351,7 @@ pub const Tab = extern struct {
         switch (mode) {
             .this => tab_view.closePage(page),
             .other => tab_view.closeOtherPages(page),
+            .right => tab_view.closePagesAfter(page),
         }
     }
 

@@ -115,6 +115,53 @@ extension Ghostty.Action {
             len = c.len
         }
     }
+
+    struct StartSearch {
+        let needle: String?
+        
+        init(c: ghostty_action_start_search_s) {
+            if let needleCString = c.needle {
+                self.needle = String(cString: needleCString)
+            } else {
+                self.needle = nil
+            }
+        }
+    }
+
+    enum PromptTitle {
+        case surface
+        case tab
+
+        init(_ c: ghostty_action_prompt_title_e) {
+            switch c {
+            case GHOSTTY_PROMPT_TITLE_TAB:
+                self = .tab
+            default:
+                self = .surface
+            }
+        }
+    }
+
+    enum KeyTable {
+        case activate(name: String)
+        case deactivate
+        case deactivateAll
+
+        init?(c: ghostty_action_key_table_s) {
+            switch c.tag {
+            case GHOSTTY_KEY_TABLE_ACTIVATE:
+                let data = Data(bytes: c.value.activate.name, count: c.value.activate.len)
+                let name = String(data: data, encoding: .utf8) ?? ""
+                self = .activate(name: name)
+            case GHOSTTY_KEY_TABLE_DEACTIVATE:
+                self = .deactivate
+            case GHOSTTY_KEY_TABLE_DEACTIVATE_ALL:
+                self = .deactivateAll
+            default:
+                return nil
+            }
+        }
+    }
 }
 
 // Putting the initializer in an extension preserves the automatic one.

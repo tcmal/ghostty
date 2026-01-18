@@ -44,6 +44,13 @@ class AppDelegate: NSObject,
     @IBOutlet private var menuPaste: NSMenuItem?
     @IBOutlet private var menuPasteSelection: NSMenuItem?
     @IBOutlet private var menuSelectAll: NSMenuItem?
+    @IBOutlet private var menuFindParent: NSMenuItem?
+    @IBOutlet private var menuFind: NSMenuItem?
+    @IBOutlet private var menuSelectionForFind: NSMenuItem?
+    @IBOutlet private var menuScrollToSelection: NSMenuItem?
+    @IBOutlet private var menuFindNext: NSMenuItem?
+    @IBOutlet private var menuFindPrevious: NSMenuItem?
+    @IBOutlet private var menuHideFindBar: NSMenuItem?
 
     @IBOutlet private var menuToggleVisibility: NSMenuItem?
     @IBOutlet private var menuToggleFullScreen: NSMenuItem?
@@ -63,6 +70,8 @@ class AppDelegate: NSObject,
     @IBOutlet private var menuDecreaseFontSize: NSMenuItem?
     @IBOutlet private var menuResetFontSize: NSMenuItem?
     @IBOutlet private var menuChangeTitle: NSMenuItem?
+    @IBOutlet private var menuChangeTabTitle: NSMenuItem?
+    @IBOutlet private var menuReadonly: NSMenuItem?
     @IBOutlet private var menuQuickTerminal: NSMenuItem?
     @IBOutlet private var menuTerminalInspector: NSMenuItem?
     @IBOutlet private var menuCommandPalette: NSMenuItem?
@@ -92,11 +101,35 @@ class AppDelegate: NSObject,
     /// The global undo manager for app-level state such as window restoration.
     lazy var undoManager = ExpiringUndoManager()
 
+    /// The current state of the quick terminal.
+    private var quickTerminalControllerState: QuickTerminalState = .uninitialized
+
     /// Our quick terminal. This starts out uninitialized and only initializes if used.
-    private(set) lazy var quickController = QuickTerminalController(
-        ghostty,
-        position: derivedConfig.quickTerminalPosition
-    )
+    var quickController: QuickTerminalController {
+        switch quickTerminalControllerState {
+        case .initialized(let controller):
+            return controller
+            
+        case .pendingRestore(let state):
+            let controller = QuickTerminalController(
+                ghostty,
+                position: derivedConfig.quickTerminalPosition,
+                baseConfig: state.baseConfig,
+                restorationState: state
+            )
+            quickTerminalControllerState = .initialized(controller)
+            return controller
+            
+        case .uninitialized:
+            let controller = QuickTerminalController(
+                ghostty,
+                position: derivedConfig.quickTerminalPosition,
+                restorationState: nil
+            )
+            quickTerminalControllerState = .initialized(controller)
+            return controller
+        }
+    }
 
     /// Manages updates
     let updateController = UpdateController()
@@ -536,8 +569,9 @@ class AppDelegate: NSObject,
         self.menuDecreaseFontSize?.setImageIfDesired(systemSymbolName: "textformat.size.smaller")
         self.menuCommandPalette?.setImageIfDesired(systemSymbolName: "filemenu.and.selection")
         self.menuQuickTerminal?.setImageIfDesired(systemSymbolName: "apple.terminal")
-        self.menuChangeTitle?.setImageIfDesired(systemSymbolName: "pencil.line")
+        self.menuChangeTabTitle?.setImageIfDesired(systemSymbolName: "pencil.line")
         self.menuTerminalInspector?.setImageIfDesired(systemSymbolName: "scope")
+        self.menuReadonly?.setImageIfDesired(systemSymbolName: "eye.fill")
         self.menuToggleFullScreen?.setImageIfDesired(systemSymbolName: "square.arrowtriangle.4.outward")
         self.menuToggleVisibility?.setImageIfDesired(systemSymbolName: "eye")
         self.menuZoomSplit?.setImageIfDesired(systemSymbolName: "arrow.up.left.and.arrow.down.right")
@@ -553,6 +587,7 @@ class AppDelegate: NSObject,
         self.menuMoveSplitDividerLeft?.setImageIfDesired(systemSymbolName: "arrow.left.to.line")
         self.menuMoveSplitDividerRight?.setImageIfDesired(systemSymbolName: "arrow.right.to.line")
         self.menuFloatOnTop?.setImageIfDesired(systemSymbolName: "square.filled.on.square")
+        self.menuFindParent?.setImageIfDesired(systemSymbolName: "text.page.badge.magnifyingglass")
     }
 
     /// Sync all of our menu item keyboard shortcuts with the Ghostty configuration.
@@ -581,6 +616,11 @@ class AppDelegate: NSObject,
         syncMenuShortcut(config, action: "paste_from_clipboard", menuItem: self.menuPaste)
         syncMenuShortcut(config, action: "paste_from_selection", menuItem: self.menuPasteSelection)
         syncMenuShortcut(config, action: "select_all", menuItem: self.menuSelectAll)
+        syncMenuShortcut(config, action: "start_search", menuItem: self.menuFind)
+        syncMenuShortcut(config, action: "search_selection", menuItem: self.menuSelectionForFind)
+        syncMenuShortcut(config, action: "scroll_to_selection", menuItem: self.menuScrollToSelection)
+        syncMenuShortcut(config, action: "search:next", menuItem: self.menuFindNext)
+        syncMenuShortcut(config, action: "search:previous", menuItem: self.menuFindPrevious)
 
         syncMenuShortcut(config, action: "toggle_split_zoom", menuItem: self.menuZoomSplit)
         syncMenuShortcut(config, action: "goto_split:previous", menuItem: self.menuPreviousSplit)
@@ -600,6 +640,7 @@ class AppDelegate: NSObject,
         syncMenuShortcut(config, action: "decrease_font_size:1", menuItem: self.menuDecreaseFontSize)
         syncMenuShortcut(config, action: "reset_font_size", menuItem: self.menuResetFontSize)
         syncMenuShortcut(config, action: "prompt_surface_title", menuItem: self.menuChangeTitle)
+        syncMenuShortcut(config, action: "prompt_tab_title", menuItem: self.menuChangeTabTitle)
         syncMenuShortcut(config, action: "toggle_quick_terminal", menuItem: self.menuQuickTerminal)
         syncMenuShortcut(config, action: "toggle_visibility", menuItem: self.menuToggleVisibility)
         syncMenuShortcut(config, action: "toggle_window_float_on_top", menuItem: self.menuFloatOnTop)
@@ -648,6 +689,18 @@ class AppDelegate: NSObject,
     }
 
     private func localEventKeyDown(_ event: NSEvent) -> NSEvent? {
+        // If the tab overview is visible and escape is pressed, close it.
+        // This can't POSSIBLY be right and is probably a FirstResponder problem
+        // that we should handle elsewhere in our program. But this works and it
+        // is guarded by the tab overview currently showing.
+        if event.keyCode == 0x35, // Escape key
+           let window = NSApp.keyWindow,
+           let tabGroup = window.tabGroup,
+           tabGroup.isOverviewVisible {
+            window.toggleTabOverview(nil)
+            return nil
+        }
+
         // If we have a main window then we don't process any of the keys
         // because we let it capture and propagate.
         guard NSApp.mainWindow == nil else { return event }
@@ -893,33 +946,8 @@ class AppDelegate: NSObject,
         var appIconName: String? = config.macosIcon.rawValue
 
         switch (config.macosIcon) {
-        case .official:
-            // Discard saved icon name
-            appIconName = nil
-            break
-        case .blueprint:
-            appIcon = NSImage(named: "BlueprintImage")!
-
-        case .chalkboard:
-            appIcon = NSImage(named: "ChalkboardImage")!
-
-        case .glass:
-            appIcon = NSImage(named: "GlassImage")!
-
-        case .holographic:
-            appIcon = NSImage(named: "HolographicImage")!
-
-        case .microchip:
-            appIcon = NSImage(named: "MicrochipImage")!
-
-        case .paper:
-            appIcon = NSImage(named: "PaperImage")!
-
-        case .retro:
-            appIcon = NSImage(named: "RetroImage")!
-
-        case .xray:
-            appIcon = NSImage(named: "XrayImage")!
+        case let icon where icon.assetName != nil:
+            appIcon = NSImage(named: icon.assetName!)!
 
         case .custom:
             if let userIcon = NSImage(contentsOfFile: config.macosCustomIcon) {
@@ -929,6 +957,7 @@ class AppDelegate: NSObject,
                 appIcon = nil // Revert back to official icon if invalid location
                 appIconName = nil // Discard saved icon name
             }
+
         case .customStyle:
             // Discard saved icon name
             // if no valid colours were found
@@ -944,10 +973,20 @@ class AppDelegate: NSObject,
             let colorStrings = ([ghostColor] + screenColors).compactMap(\.hexString)
             appIconName = (colorStrings + [config.macosIconFrame.rawValue])
                 .joined(separator: "_")
+
+        default:
+            // Discard saved icon name
+            appIconName = nil
         }
-        // Only change the icon if it has actually changed
-        // from the current one
-        guard UserDefaults.standard.string(forKey: "CustomGhosttyIcon") != appIconName else {
+
+        // Only change the icon if it has actually changed from the current one,
+        // or if the app build has changed (e.g. after an update that reset the icon)
+        let cachedIconName = UserDefaults.standard.string(forKey: "CustomGhosttyIcon")
+        let cachedIconBuild = UserDefaults.standard.string(forKey: "CustomGhosttyIconBuild")
+        let currentBuild = Bundle.main.infoDictionary?["CFBundleVersion"] as? String
+        let buildChanged = cachedIconBuild != currentBuild
+
+        guard cachedIconName != appIconName || buildChanged else {
 #if DEBUG
             if appIcon == nil {
                 await MainActor.run {
@@ -964,14 +1003,16 @@ class AppDelegate: NSObject,
         let newIcon = appIcon
 
         let appPath = Bundle.main.bundlePath
-        NSWorkspace.shared.setIcon(newIcon, forFile: appPath, options: [])
+        guard NSWorkspace.shared.setIcon(newIcon, forFile: appPath, options: []) else { return }
         NSWorkspace.shared.noteFileSystemChanged(appPath)
 
         await MainActor.run {
             self.appIcon = newIcon
             NSApplication.shared.applicationIconImage = newIcon
         }
+
         UserDefaults.standard.set(appIconName, forKey: "CustomGhosttyIcon")
+        UserDefaults.standard.set(currentBuild, forKey: "CustomGhosttyIconBuild")
     }
 
     //MARK: - Restorable State
@@ -983,10 +1024,31 @@ class AppDelegate: NSObject,
 
     func application(_ app: NSApplication, willEncodeRestorableState coder: NSCoder) {
         Self.logger.debug("application will save window state")
+        
+        guard ghostty.config.windowSaveState != "never" else { return }
+        
+        // Encode our quick terminal state if we have it.
+        switch quickTerminalControllerState {
+        case .initialized(let controller) where controller.restorable:
+            let data = QuickTerminalRestorableState(from: controller)
+            data.encode(with: coder)
+            
+        case .pendingRestore(let state):
+            state.encode(with: coder)
+            
+        default:
+            break
+        }
     }
 
     func application(_ app: NSApplication, didDecodeRestorableState coder: NSCoder) {
         Self.logger.debug("application will restore window state")
+        
+        // Decode our quick terminal state.
+        if ghostty.config.windowSaveState != "never",
+            let state = QuickTerminalRestorableState(coder: coder) {
+            quickTerminalControllerState = .pendingRestore(state)
+        }
     }
 
     //MARK: - UNUserNotificationCenterDelegate
@@ -1175,10 +1237,19 @@ class AppDelegate: NSObject,
             // want to bring back these windows if we remove the toggle.
             //
             // We also ignore fullscreen windows because they don't hide anyways.
-            self.hiddenWindows = NSApp.windows.filter {
+            var visibleWindows = [Weak<NSWindow>]()
+            NSApp.windows.filter {
                 $0.isVisible &&
                 !$0.styleMask.contains(.fullScreen)
-            }.map { Weak($0) }
+            }.forEach { window in
+                // We only keep track of selectedWindow if it's in a tabGroup,
+                // so we can keep its selection state when restoring
+                let windowToHide = window.tabGroup?.selectedWindow ?? window
+                if !visibleWindows.contains(where: { $0.value === windowToHide }) {
+                    visibleWindows.append(Weak(windowToHide))
+                }
+            }
+            self.hiddenWindows = visibleWindows
         }
 
         func restore() {
@@ -1249,6 +1320,16 @@ extension AppDelegate: NSMenuItemValidation {
             return true
         }
     }
+}
+
+/// Represents the state of the quick terminal controller.
+private enum QuickTerminalState {
+    /// Controller has not been initialized and has no pending restoration state.
+    case uninitialized
+    /// Restoration state is pending; controller will use this when first accessed.
+    case pendingRestore(QuickTerminalRestorableState)
+    /// Controller has been initialized.
+    case initialized(QuickTerminalController)
 }
 
 @globalActor

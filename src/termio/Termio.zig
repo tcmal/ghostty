@@ -5,29 +5,25 @@
 pub const Termio = @This();
 
 const std = @import("std");
-const builtin = @import("builtin");
-const build_config = @import("../build_config.zig");
 const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const EnvMap = std.process.EnvMap;
 const posix = std.posix;
 const termio = @import("../termio.zig");
-const Command = @import("../Command.zig");
-const Pty = @import("../pty.zig").Pty;
 const StreamHandler = @import("stream_handler.zig").StreamHandler;
 const terminalpkg = @import("../terminal/main.zig");
-const terminfo = @import("../terminfo/main.zig");
 const xev = @import("../global.zig").xev;
 const renderer = @import("../renderer.zig");
 const apprt = @import("../apprt.zig");
-const fastmem = @import("../fastmem.zig");
 const internal_os = @import("../os/main.zig");
 const windows = internal_os.windows;
 const configpkg = @import("../config.zig");
-const shell_integration = @import("shell_integration.zig");
 
 const log = std.log.scoped(.io_exec);
+
+/// Mutex state argument for queueMessage.
+pub const MutexState = enum { locked, unlocked };
 
 /// Allocator
 alloc: Allocator,
@@ -387,7 +383,7 @@ pub fn threadExit(self: *Termio, data: *ThreadData) void {
 pub fn queueMessage(
     self: *Termio,
     msg: termio.Message,
-    mutex: enum { locked, unlocked },
+    mutex: MutexState,
 ) void {
     self.mailbox.send(msg, switch (mutex) {
         .locked => self.renderer_state.mutex,

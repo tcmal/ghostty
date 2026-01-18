@@ -1,5 +1,4 @@
 const std = @import("std");
-const build_config = @import("../../../build_config.zig");
 const assert = @import("../../../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const adw = @import("adw");
@@ -8,17 +7,11 @@ const glib = @import("glib");
 const gobject = @import("gobject");
 const gtk = @import("gtk");
 
-const i18n = @import("../../../os/main.zig").i18n;
 const apprt = @import("../../../apprt.zig");
-const input = @import("../../../input.zig");
-const CoreSurface = @import("../../../Surface.zig");
-const gtk_version = @import("../gtk_version.zig");
-const adw_version = @import("../adw_version.zig");
 const ext = @import("../ext.zig");
 const gresource = @import("../build/gresource.zig");
 const Common = @import("../class.zig").Common;
 const WeakRef = @import("../weak_ref.zig").WeakRef;
-const Config = @import("config.zig").Config;
 const Application = @import("application.zig").Application;
 const CloseConfirmationDialog = @import("close_confirmation_dialog.zig").CloseConfirmationDialog;
 const Surface = @import("surface.zig").Surface;
@@ -226,7 +219,7 @@ pub const SplitTree = extern struct {
         // Inherit properly if we were asked to.
         if (parent_) |p| {
             if (p.core()) |core| {
-                surface.setParent(core);
+                surface.setParent(core, .split);
             }
         }
 
@@ -346,6 +339,35 @@ pub const SplitTree = extern struct {
         // Get the surface at the target location and grab focus.
         const surface = tree.nodes[target.idx()].leaf;
         surface.grabFocus();
+
+        // We also need to setup our last_focused to this because if we
+        // trigger a tree change like below, the grab focus above never
+        // actually triggers in time to set this and this ensures we
+        // grab focus to the right thing.
+        const old_last_focused = self.private().last_focused.get();
+        defer if (old_last_focused) |v| v.unref(); // unref strong ref from get
+        self.private().last_focused.set(surface);
+        errdefer self.private().last_focused.set(old_last_focused);
+
+        if (tree.zoomed != null) {
+            const app = Application.default();
+            const config_obj = app.getConfig();
+            defer config_obj.unref();
+            const config = config_obj.get();
+
+            if (!config.@"split-preserve-zoom".navigation) {
+                tree.zoomed = null;
+            } else {
+                tree.zoom(target);
+            }
+
+            // When the zoom state changes our tree state changes and
+            // we need to send the proper notifications to trigger
+            // relayout.
+            const object = self.as(gobject.Object);
+            object.notifyByPspec(properties.tree.impl.param_spec);
+            object.notifyByPspec(properties.@"is-zoomed".impl.param_spec);
+        }
 
         return true;
     }

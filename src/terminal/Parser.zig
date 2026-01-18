@@ -5,8 +5,6 @@
 const Parser = @This();
 
 const std = @import("std");
-const builtin = @import("builtin");
-const assert = @import("../quirks.zig").inlineAssert;
 const testing = std.testing;
 const table = @import("parse_table.zig").table;
 const osc = @import("osc.zig");
@@ -361,7 +359,7 @@ inline fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
             break :param null;
         },
         .osc_put => osc_put: {
-            self.osc_parser.next(c);
+            @call(.always_inline, osc.Parser.next, .{ &self.osc_parser, c });
             break :osc_put null;
         },
         .csi_dispatch => csi_dispatch: {

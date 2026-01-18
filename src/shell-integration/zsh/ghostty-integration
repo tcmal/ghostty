@@ -1,3 +1,5 @@
+# vim:ft=zsh
+#
 # Based on (started as) a copy of Kitty's zsh integration. Kitty is
 # distributed under GPLv3, so this file is also distributed under GPLv3.
 # The license header is reproduced below:
@@ -41,6 +43,13 @@ _entrypoint() {
     [[ -o interactive ]]              || builtin return 0  # non-interactive shell
     (( ! $+_ghostty_state ))          || builtin return 0  # already initialized
 
+    # We require zsh 5.1+ (released Sept 2015) for features like functions_source,
+    # introspection arrays, and array pattern substitution.
+    if ! { builtin autoload -- is-at-least 2>/dev/null && is-at-least 5.1; }; then
+        builtin echo "Zsh ${ZSH_VERSION} is too old for ghostty shell integration (5.1+ required)" >&2
+        builtin return 1
+    fi
+
     # 0: no OSC 133 [AC] marks have been written yet.
     # 1: the last written OSC 133 C has not been closed with D yet.
     # 2: none of the above.
@@ -83,9 +92,6 @@ _entrypoint() {
 
 _ghostty_deferred_init() {
     builtin emulate -L zsh -o no_warn_create_global -o no_aliases
-
-    # The directory where ghostty-integration is located: /../shell-integration/zsh.
-    builtin local self_dir="${functions_source[_ghostty_deferred_init]:A:h}"
 
     # Enable semantic markup with OSC 133.
     _ghostty_precmd() {
@@ -195,11 +201,11 @@ _ghostty_deferred_init() {
     _ghostty_report_pwd
 
     if [[ "$GHOSTTY_SHELL_FEATURES" == *"title"* ]]; then
-      # Enable terminal title changes.
+      # Enable terminal title changes, formatted for user-friendly display.
       functions[_ghostty_precmd]+="
           builtin print -rnu $_ghostty_fd \$'\\e]2;'\"\${(%):-%(4~|…/%3~|%~)}\"\$'\\a'"
       functions[_ghostty_preexec]+="
-          builtin print -rnu $_ghostty_fd \$'\\e]2;'\"\${(V)1}\"\$'\\a'"
+          builtin print -rnu $_ghostty_fd \$'\\e]2;'\"\${1//[[:cntrl:]]}\"\$'\\a'"
     fi
 
     if [[ "$GHOSTTY_SHELL_FEATURES" == *"cursor"* ]]; then
@@ -246,7 +252,7 @@ _ghostty_deferred_init() {
         if [[ "$sudo_has_sudoedit_flags" == "yes" ]]; then
           builtin command sudo "$@";
         else
-          builtin command sudo TERMINFO="$TERMINFO" "$@";
+          builtin command sudo --preserve-env=TERMINFO "$@";
         fi
       }
     fi

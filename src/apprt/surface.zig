@@ -6,15 +6,15 @@ const build_config = @import("../build_config.zig");
 const App = @import("../App.zig");
 const Surface = @import("../Surface.zig");
 const renderer = @import("../renderer.zig");
-const termio = @import("../termio.zig");
 const terminal = @import("../terminal/main.zig");
 const Config = @import("../config.zig").Config;
+const MessageData = @import("../datastruct/main.zig").MessageData;
 
 /// The message types that can be sent to a single surface.
 pub const Message = union(enum) {
     /// Represents a write request. Magic number comes from the max size
     /// we want this union to be.
-    pub const WriteReq = termio.MessageData(u8, 255);
+    pub const WriteReq = MessageData(u8, 255);
 
     /// Set the title of the surface.
     /// TODO: we should change this to a "WriteReq" style structure in
@@ -107,6 +107,12 @@ pub const Message = union(enum) {
     /// The scrollbar state changed for the surface.
     scrollbar: terminal.Scrollbar,
 
+    /// Search progress update
+    search_total: ?usize,
+
+    /// Selected search index change
+    search_selected: ?usize,
+
     pub const ReportTitleStyle = enum {
         csi_21_t,
 
@@ -153,12 +159,28 @@ pub const Mailbox = struct {
     }
 };
 
+/// Context for new surface creation to determine inheritance behavior
+pub const NewSurfaceContext = enum(c_int) {
+    window = 0,
+    tab = 1,
+    split = 2,
+};
+
+pub fn shouldInheritWorkingDirectory(context: NewSurfaceContext, config: *const Config) bool {
+    return switch (context) {
+        .window => config.@"window-inherit-working-directory",
+        .tab => config.@"tab-inherit-working-directory",
+        .split => config.@"split-inherit-working-directory",
+    };
+}
+
 /// Returns a new config for a surface for the given app that should be
 /// used for any new surfaces. The resulting config should be deinitialized
 /// after the surface is initialized.
 pub fn newConfig(
     app: *const App,
     config: *const Config,
+    context: NewSurfaceContext,
 ) Allocator.Error!Config {
     // Create a shallow clone
     var copy = config.shallowClone(app.alloc);
@@ -169,7 +191,7 @@ pub fn newConfig(
     // Get our previously focused surface for some inherited values.
     const prev = app.focusedSurface();
     if (prev) |p| {
-        if (config.@"window-inherit-working-directory") {
+        if (shouldInheritWorkingDirectory(context, config)) {
             if (try p.pwd(alloc)) |pwd| {
                 copy.@"working-directory" = pwd;
             }

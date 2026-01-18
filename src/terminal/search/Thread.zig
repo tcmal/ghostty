@@ -17,11 +17,10 @@ const Mutex = std.Thread.Mutex;
 const xev = @import("../../global.zig").xev;
 const internal_os = @import("../../os/main.zig");
 const BlockingQueue = @import("../../datastruct/main.zig").BlockingQueue;
+const MessageData = @import("../../datastruct/main.zig").MessageData;
 const point = @import("../point.zig");
 const FlattenedHighlight = @import("../highlight.zig").Flattened;
 const UntrackedHighlight = @import("../highlight.zig").Untracked;
-const PageList = @import("../PageList.zig");
-const Screen = @import("../Screen.zig");
 const ScreenSet = @import("../ScreenSet.zig");
 const Selection = @import("../Selection.zig");
 const Terminal = @import("../Terminal.zig");
@@ -242,7 +241,10 @@ fn drainMailbox(self: *Thread) !void {
     while (self.mailbox.pop()) |message| {
         log.debug("mailbox message={}", .{message});
         switch (message) {
-            .change_needle => |v| try self.changeNeedle(v),
+            .change_needle => |v| {
+                defer v.deinit();
+                try self.changeNeedle(v.slice());
+            },
             .select => |v| try self.select(v),
         }
     }
@@ -255,18 +257,46 @@ fn select(self: *Thread, sel: ScreenSearch.Select) !void {
     self.opts.mutex.lock();
     defer self.opts.mutex.unlock();
 
-    // The selection will trigger a selection change notification
-    // if it did change.
-    if (try screen_search.select(sel)) scroll: {
-        if (screen_search.selected) |m| {
-            // Selection changed, let's scroll the viewport to see it
-            // since we have the lock anyways.
-            const screen = self.opts.terminal.screens.get(
-                s.last_screen.key,
-            ) orelse break :scroll;
-            screen.scroll(.{ .pin = m.highlight.start.* });
+    // Make the selection. Ignore the result because we don't
+    // care if the selection didn't change.
+    _ = try screen_search.select(sel);
+
+    // Grab our match if we have one. If we don't have a selection
+    // then we do nothing.
+    const flattened = screen_search.selectedMatch() orelse return;
+
+    // No matter what we reset our selected match cache. This will
+    // trigger a callback which will trigger the renderer to wake up
+    // so it can be notified the screen scrolled.
+    s.last_screen.selected = null;
+
+    // Grab the current screen and see if this match is visible within
+    // the viewport already. If it is, we do nothing.
+    const screen = self.opts.terminal.screens.get(
+        s.last_screen.key,
+    ) orelse return;
+
+    // Grab the viewport. Viewports and selections are usually small
+    // so this check isn't very expensive, despite appearing O(N^2),
+    // both Ns are usually equal to 1.
+    var it = screen.pages.pageIterator(
+        .right_down,
+        .{ .viewport = .{} },
+        null,
+    );
+    const hl_chunks = flattened.chunks.slice();
+    while (it.next()) |chunk| {
+        for (0..hl_chunks.len) |i| {
+            const hl_chunk = hl_chunks.get(i);
+            if (chunk.overlaps(.{
+                .node = hl_chunk.node,
+                .start = hl_chunk.start,
+                .end = hl_chunk.end,
+            })) return;
         }
     }
+
+    screen.scroll(.{ .pin = flattened.startPin() });
 }
 
 /// Change the search term to the given value.
@@ -275,6 +305,9 @@ fn changeNeedle(self: *Thread, needle: []const u8) !void {
 
     // Stop the previous search
     if (self.search) |*s| {
+        // If our search is unchanged, do nothing.
+        if (std.ascii.eqlIgnoreCase(s.viewport.needle(), needle)) return;
+
         s.deinit();
         self.search = null;
 
@@ -282,6 +315,10 @@ fn changeNeedle(self: *Thread, needle: []const u8) !void {
         if (self.opts.event_cb) |cb| {
             cb(
                 .{ .total_matches = 0 },
+                self.opts.event_userdata,
+            );
+            cb(
+                .{ .selected_match = null },
                 self.opts.event_userdata,
             );
             cb(
@@ -414,10 +451,14 @@ pub const Mailbox = BlockingQueue(Message, 64);
 
 /// The messages that can be sent to the thread.
 pub const Message = union(enum) {
+    /// Represents a write request. Magic number comes from the max size
+    /// we want this union to be.
+    pub const WriteReq = MessageData(u8, 255);
+
     /// Change the search term. If no prior search term is given this
     /// will start a search. If an existing search term is given this will
     /// stop the prior search and start a new one.
-    change_needle: []const u8,
+    change_needle: WriteReq,
 
     /// Select a search result.
     select: ScreenSearch.Select,
@@ -632,8 +673,20 @@ const Search = struct {
         // found the viewport/active area dirty, so we should mark it as
         // dirty in our viewport searcher so it forces a re-search.
         if (t.flags.search_viewport_dirty) {
-            self.viewport.active_dirty = true;
             t.flags.search_viewport_dirty = false;
+
+            // Mark our viewport dirty so it researches the active
+            self.viewport.active_dirty = true;
+
+            // Reload our active area for our active screen
+            if (self.screens.getPtr(t.screens.active_key)) |screen_search| {
+                screen_search.reloadActive() catch |err| switch (err) {
+                    error.OutOfMemory => log.warn(
+                        "error reloading active area for screen key={} err={}",
+                        .{ t.screens.active_key, err },
+                    ),
+                };
+            }
         }
 
         // Check our viewport for changes.
@@ -820,7 +873,10 @@ test {
 
     // Start our search
     _ = thread.mailbox.push(
-        .{ .change_needle = "world" },
+        .{ .change_needle = try .init(
+            alloc,
+            @as([]const u8, "world"),
+        ) },
         .forever,
     );
     try thread.wakeup.notify();
